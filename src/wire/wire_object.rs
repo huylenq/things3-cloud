@@ -224,12 +224,14 @@ impl Serialize for WireObject {
 impl<'de> Deserialize<'de> for WireObject {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = RawWireObject::deserialize(deserializer)?;
-        let payload = WireObject::properties_from(
+        let payload = match WireObject::properties_from(
             raw.operation_type,
             raw.entity_type.as_ref(),
-            raw.properties,
-        )
-        .map_err(serde::de::Error::custom)?;
+            raw.properties.clone(),
+        ) {
+            Ok(parsed) => parsed,
+            Err(_) => Properties::Unknown(raw.properties),
+        };
         Ok(Self {
             operation_type: raw.operation_type,
             entity_type: raw.entity_type,
