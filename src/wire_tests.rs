@@ -221,6 +221,19 @@ mod tests {
     }
 
     #[test]
+    fn wire_object_falls_back_to_unknown_when_typed_payload_fails() {
+        let parsed: WireObject = serde_json::from_str(r#"{"t":0,"e":"Task6","p":{"tt":123}}"#)
+            .expect("typed payload failure should not fail WireObject decode");
+
+        match parsed.payload {
+            Properties::Unknown(map) => {
+                assert_eq!(map.get("tt"), Some(&serde_json::json!(123)));
+            }
+            other => panic!("expected Unknown fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn typed_properties_dispatch_for_task_create() {
         let parsed: WireObject =
             serde_json::from_str(r#"{"t":0,"e":"Task6","p":{"tt":"A","ss":0,"tp":0,"st":0}}"#)

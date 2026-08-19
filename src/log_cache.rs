@@ -194,6 +194,7 @@ pub fn fold_state_from_append_log(cache_dir: &Path) -> Result<RawState> {
     file.seek(SeekFrom::Start(byte_offset))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
+    let mut pending = String::new();
     let mut safe_offset = byte_offset;
 
     loop {
@@ -207,16 +208,30 @@ pub fn fold_state_from_append_log(cache_dir: &Path) -> Result<RawState> {
             break;
         }
 
-        let stripped = line.trim();
+        pending.push_str(&line);
+        let unescaped = unescape_raw_newlines_in_json_strings(&pending);
+        let stripped = unescaped.trim();
         if stripped.is_empty() {
+            pending.clear();
             safe_offset = reader.stream_position()?;
             continue;
         }
-        let item: WireItem = serde_json::from_str(stripped)
-            .with_context(|| format!("Corrupt log entry at {}", log_path.display()))?;
-        fold_item(item, &mut state);
-        new_lines += 1;
-        safe_offset = reader.stream_position()?;
+
+        match serde_json::from_str::<WireItem>(stripped) {
+            Ok(item) => {
+                fold_item(item, &mut state);
+                new_lines += 1;
+                pending.clear();
+                safe_offset = reader.stream_position()?;
+            }
+            Err(_) => {
+                // Object spans more lines; keep accumulating.
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        return Err(anyhow!("Corrupt log entry at {}", log_path.display()));
     }
 
     if new_lines > 0 {
@@ -265,6 +280,51 @@ pub fn sync_append_log_or_err(client: &mut ThingsCloudClient, cache_dir: &Path) 
     sync_append_log(client, cache_dir).map_err(|e| anyhow!(e.to_string()))
 }
 
+/// Things Cloud history sometimes writes raw newlines inside JSON string
+/// values (typically note text). Walk `text` and, while inside a JSON
+/// string, turn raw `\n` into the two-character escape `\\n` and drop
+/// raw `\r`.
+fn unescape_raw_newlines_in_json_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in text.chars() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+            continue;
+        }
+
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                out.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                out.push(ch);
+                in_string = false;
+            }
+            '\n' => {
+                out.push('\\');
+                out.push('n');
+            }
+            '\r' => {}
+            _ => out.push(ch),
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +363,24 @@ mod tests {
         let expected_offset = fs::metadata(&log_path).expect("log metadata").len();
         let (_, second_offset) = read_state_cache(cache_dir);
         assert_eq!(second_offset, expected_offset);
+    }
+
+    #[test]
+    fn fold_state_accepts_raw_newlines_inside_json_strings() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = temp_dir.path();
+        let log_path = cache_dir.join("things.log");
+
+        let line_one = r#"{"3C6BBD49-8D11-4FFF-8B0E-B8F33FA9C00A":{"t":0,"e":"Settings5","p":{}}}"#;
+        let line_two = concat!(
+            r#"{"4C6BBD49-8D11-4FFF-8B0E-B8F33FA9C00B":{"t":0,"e":"Task6","p":{"tt":"Note task","nt":{"_t":"tx","t":2,"ps":[{"r":"line one"#,
+            "\n",
+            r#"line two"}]}}}}"#,
+        );
+
+        fs::write(&log_path, format!("{line_one}\n{line_two}\n")).expect("seed log");
+
+        let state = fold_state_from_append_log(cache_dir).expect("fold with raw newlines");
+        assert_eq!(state.len(), 2);
     }
 }
